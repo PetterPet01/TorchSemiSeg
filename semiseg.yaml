@@ -2,6 +2,7 @@ name: semiseg
 channels:
   - defaults
 dependencies:
+  - python=3.6
   - _ipyw_jlab_nb_ext_conf=0.1.0=py36_0
   - _libgcc_mutex=0.1=main
   - _tflow_select=2.3.0=mkl
@@ -271,7 +272,6 @@ dependencies:
   - urllib3=1.23=py36_0
   - wcwidth=0.1.7=py36_0
   - webencodings=0.5.1=py36_1
-  - werkzeug=0.14.1=py36_0
   - wheel=0.32.3=py36_0
   - widgetsnbextension=3.4.2=py36_0
   - wrapt=1.10.11=py36h14c3975_2
