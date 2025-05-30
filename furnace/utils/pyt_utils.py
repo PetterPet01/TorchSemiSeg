@@ -43,7 +43,6 @@ def load_model(model, model_file, is_restore=False):
             new_state_dict[name] = v
         state_dict = new_state_dict
 
-
     model.load_state_dict(state_dict, strict=False)
     ckpt_keys = set(state_dict.keys())
     own_keys = set(model.state_dict().keys())
@@ -58,12 +57,12 @@ def load_model(model, model_file, is_restore=False):
 
     return model
 
+
 def load_dualpath_model(model, model_file, is_restore=False):
     # load raw state_dict
     t_start = time.time()
     if isinstance(model_file, str):
         raw_state_dict = torch.load(model_file)
-
 
         if 'model' in raw_state_dict.keys():
             raw_state_dict = raw_state_dict['model']
@@ -125,31 +124,60 @@ def load_dualpath_model(model, model_file, is_restore=False):
 
     return model
 
-def parse_devices(input_devices):
-    if input_devices.endswith('*'):
-        devices = list(range(torch.cuda.device_count()))
-        return devices
 
-    devices = []
-    for d in input_devices.split(','):
-        if '-' in d:
-            start_device, end_device = d.split('-')[0], d.split('-')[1]
-            assert start_device != ''
-            assert end_device != ''
-            start_device, end_device = int(start_device), int(end_device)
-            assert start_device < end_device
-            assert end_device < torch.cuda.device_count()
-            for sd in range(start_device, end_device + 1):
-                devices.append(sd)
+def parse_devices(device_str):
+    final_devices = []
+    if not device_str:  # Handle empty string case
+        # Or raise error, or default to all available, depending on desired behavior
+        return []
+
+    parts = device_str.split(',')
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if '-' in part:
+            # This is a range, e.g., "0-2"
+            try:
+                start_str, end_str = part.split('-')
+                start_device = int(start_str)
+                end_device = int(end_str)  # In "X-Y", Y might be inclusive or exclusive
+            except ValueError:
+                raise ValueError(f"Invalid device range format: {part}")
+
+            # The problematic assertion:
+            # If "X-Y" means devices X, X+1, ..., Y-1 (exclusive end, like Python's range(X,Y))
+            # then assert start_device < end_device is appropriate here.
+            # And the loop would be range(start_device, end_device).
+            assert start_device < end_device, \
+                f"In range '{part}', start_device ({start_device}) must be strictly less than end_device ({end_device})."
+
+            # Example: if range X-Y means devices X, ..., Y-1
+            for i in range(start_device, end_device):
+                if i not in final_devices:
+                    final_devices.append(i)
+
+            # Alternative: if range X-Y means devices X, ..., Y (inclusive end)
+            # assert start_device <= end_device
+            # for i in range(start_device, end_device + 1):
+            #    if i not in final_devices:
+            #        final_devices.append(i)
+
         else:
-            device = int(d)
-            assert device < torch.cuda.device_count()
-            devices.append(device)
+            # This is a single device, e.g., "0" or "1"
+            # This path should NOT trigger the start_device < end_device assertion.
+            try:
+                device_id = int(part)
+            except ValueError:
+                raise ValueError(f"Invalid device ID format: {part}")
+            if device_id not in final_devices:
+                final_devices.append(device_id)
 
-    logger.info('using devices {}'.format(
-        ', '.join([str(d) for d in devices])))
+    if not final_devices:
+        raise ValueError("No valid devices specified.")
 
-    return devices
+    return sorted(list(set(final_devices)))  # Return unique, sorted device IDs
 
 
 def extant_file(x):

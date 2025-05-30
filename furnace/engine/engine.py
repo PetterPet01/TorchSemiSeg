@@ -11,7 +11,6 @@ import argparse
 
 import shutil
 import torch
-import torch.distributed as dist
 
 from .logger import get_logger
 from .version import __version__
@@ -33,8 +32,6 @@ class State(object):
 
     def register(self, **kwargs):
         for k, v in kwargs.items():
-            # assert k in ['epoch', 'iteration', 'dataloader', 'model',
-            #              'optimizer']
             setattr(self, k, v)
 
 
@@ -45,8 +42,9 @@ class Engine(object):
             "PyTorch Version {}, Furnace Version {}".format(torch.__version__,
                                                             self.version))
         self.state = State()
-        self.devices = None
-        self.distributed = False
+        self.device = None  # Will be the primary torch.device object (e.g., cuda:0)
+        self.devices = []  # List of GPU device IDs (int), e.g., [0, 1] or [0]
+        self.distributed = False  # Always False for single node
 
         if custom_parser is None:
             self.parser = argparse.ArgumentParser()
@@ -63,36 +61,34 @@ class Engine(object):
             self.continue_state_object = None
         print('continue_state_object: ', self.continue_state_object)
 
-        if 'WORLD_SIZE' in os.environ:
-            self.distributed = int(os.environ['WORLD_SIZE']) >= 1
+        # Device setup for single-node multi-GPU / single GPU / CPU
+        # self.args.devices will be e.g. "0", "0,1", "" (default), "cpu"
+        parsed_gpu_ids = parse_devices(self.args.devices)  # list of ints, or [] for 'cpu'
 
-        if self.distributed:
-            self.local_rank = self.args.local_rank
-            self.world_size = int(os.environ['WORLD_SIZE'])
-            torch.cuda.set_device(self.local_rank)
-            os.environ['MASTER_PORT'] = self.args.port
-            dist.init_process_group(backend="nccl", init_method='env://')
-            self.devices = [i for i in range(self.world_size)]
+        if parsed_gpu_ids and torch.cuda.is_available():  # We have GPU IDs and CUDA is truly available
+            self.devices = parsed_gpu_ids  # Store all specified GPU IDs
+            if not self.devices:  # Should not happen if parsed_gpu_ids is true, but defensive
+                logger.warning("Parsed GPU IDs were non-empty but resulted in an empty list. Defaulting to CPU.")
+                self.device = torch.device("cpu")
+                self.devices = []
+                logger.info("Using CPU.")
+            else:
+                # The primary device will be the first one in the list
+                self.device = torch.device(f"cuda:{self.devices[0]}")
+                torch.cuda.set_device(self.devices[0])  # Set default CUDA device for PyTorch context
+                logger.info(f"Using GPU(s): {self.devices}. Primary device: {self.device}")
         else:
-            self.devices = parse_devices(self.args.devices)
+            self.device = torch.device("cpu")
+            self.devices = []  # No CUDA GPUs to use
+            logger.info("Using CPU. If you intended to use GPU, please check CUDA availability and device argument.")
 
     def inject_default_parser(self):
         p = self.parser
-        p.add_argument('-d', '--devices', default='',
-                       help='set data parallel training')
-        # p.add_argument('-c', '--continue', type=extant_file,
-        #                metavar="FILE",
-        #                dest="continue_fpath",
-        #                help='continue from one certain checkpoint')
+        p.add_argument('-d', '--devices', default='0',  # Default to GPU 0 if available
+                       help='set target device(s) e.g. "0" for cuda:0, "0,1" for cuda:0 and cuda:1, "cpu" for CPU.')
         p.add_argument('-c', '--continue', type=str,
                        dest="continue_fpath",
                        help='continue from one certain checkpoint')
-        p.add_argument('--local_rank', default=0, type=int,
-                       help='process rank on node')
-        p.add_argument('-p', '--port', type=str,
-                       default='16001',
-                       dest="port",
-                       help='port for init_process_group')
         p.add_argument('--debug', default=0, type=int,
                        help='whether to use the debug mode')
 
@@ -108,15 +104,24 @@ class Engine(object):
         t_start = time.time()
 
         state_dict = {}
-
         from collections import OrderedDict
         new_state_dict = OrderedDict()
-        for k, v in self.state.model.state_dict().items():
+
+        # If model is wrapped by DataParallel, actual model is model.module
+        model_to_save = self.state.model.module if isinstance(self.state.model,
+                                                              torch.nn.DataParallel) else self.state.model
+        model_state_dict = model_to_save.state_dict()
+
+        for k, v in model_state_dict.items():
+            # The original code already handles stripping 'module.' if it somehow exists
+            # in the raw model's state_dict (which is unusual).
+            # DataParallel itself adds 'module.' to keys, so we save model.module.state_dict()
             key = k
-            if k.split('.')[0] == 'module':
+            if k.startswith('module.'):  # This condition is unlikely if we save model_to_save.state_dict()
                 key = k[7:]
             new_state_dict[key] = v
         state_dict['model'] = new_state_dict
+
         if self.state.optimizer is not None:
             state_dict['optimizer'] = self.state.optimizer.state_dict()
         if self.state.optimizer_l is not None:
@@ -141,7 +146,6 @@ class Engine(object):
         ensure_dir(target)
         link_file(source, target)
 
-
     def save_and_link_checkpoint(self, snapshot_dir, log_dir, log_dir_link, name=None):
         ensure_dir(snapshot_dir)
         if not osp.exists(log_dir_link):
@@ -153,37 +157,59 @@ class Engine(object):
             current_epoch_checkpoint = osp.join(snapshot_dir, '{}.pth'.format(
                 name))
 
-        ''' 如果旧文件存在，先删除 '''
         if os.path.exists(current_epoch_checkpoint):
             os.remove(current_epoch_checkpoint)
 
         self.save_checkpoint(current_epoch_checkpoint)
         last_epoch_checkpoint = osp.join(snapshot_dir,
                                          'epoch-last.pth')
-        # link_file(current_epoch_checkpoint, last_epoch_checkpoint)
         try:
             shutil.copy(current_epoch_checkpoint, last_epoch_checkpoint)
-        except:
+        except Exception as e:
+            logger.warning(f"Could not copy checkpoint to {last_epoch_checkpoint}: {e}")
             pass
 
     def restore_checkpoint(self):
         t_start = time.time()
-        if self.distributed:
-            tmp = torch.load(self.continue_state_object,
-                             map_location=lambda storage, loc: storage.cuda(
-                                 self.local_rank))
-        else:
-            tmp = torch.load(self.continue_state_object)
+        # Load to the primary device specified during Engine initialization
+        # If self.device is CPU, map_location will be 'cpu'.
+        # If self.device is cuda:X, map_location will be 'cuda:X'.
+        tmp = torch.load(self.continue_state_object, map_location=self.device)
         t_ioend = time.time()
 
-        self.state.model = load_model(self.state.model, tmp['model'],
-                                      True)
-        if 'optimizer_l' in tmp:
+        # The model instance (self.state.model) should already be created.
+        # If it's going to be DataParallel, it should be wrapped *before* restoring.
+        # load_model expects the state_dict for the raw model (without 'module.' prefix)
+
+        actual_model = self.state.model.module if isinstance(self.state.model,
+                                                             torch.nn.DataParallel) else self.state.model
+
+        # Ensure the actual_model's parameters are on the primary device before loading state
+        # This helps if load_model or optimizers expect parameters to be on a certain device.
+        actual_model.to(self.device)
+
+        load_model(actual_model, tmp['model'], True)  # True for strict loading
+
+        if 'optimizer_l' in tmp and self.state.optimizer_l is not None:
             self.state.optimizer_l.load_state_dict(tmp['optimizer_l'])
-        if 'optimizer_r' in tmp:
+            # Move optimizer states to the primary device if necessary
+            for state in self.state.optimizer_l.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(self.device)
+        if 'optimizer_r' in tmp and self.state.optimizer_r is not None:
             self.state.optimizer_r.load_state_dict(tmp['optimizer_r'])
-        if 'optimizer' in tmp:
+            for state in self.state.optimizer_r.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(self.device)
+        if 'optimizer' in tmp and self.state.optimizer is not None:
             self.state.optimizer.load_state_dict(tmp['optimizer'])
+            for state in self.state.optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(self.device)
+
         self.state.epoch = tmp['epoch'] + 1
         self.state.iteration = tmp['iteration']
         del tmp
@@ -197,9 +223,10 @@ class Engine(object):
         return self
 
     def __exit__(self, type, value, tb):
-        torch.cuda.empty_cache()
+        if self.device.type == 'cuda':  # Check if primary device is cuda
+            torch.cuda.empty_cache()
         if type is not None:
             logger.warning(
-                "A exception occurred during Engine initialization, "
+                "An exception occurred during Engine execution: {} {}".format(type, value) +
                 "give up running process")
             return False
